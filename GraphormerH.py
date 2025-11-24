@@ -3,7 +3,8 @@ from typing import Optional, Dict, Tuple, List
 import torch
 from torch import nn
 import torch.nn.functional as F
-from tokenizer import GlycanGraph, GLYCO_VOCAB_SIZE, iupac_to_glycan_graph
+from rdkit import Chem
+from tokenizer import GlycanGraph, GLYCO_VOCAB_SIZE, GLYCOWORDS, iupac_to_glycan_graph
 
 Batch = Dict[str, torch.Tensor]
 
@@ -447,6 +448,8 @@ class GraphormerGraphEncoder(nn.Module):
 
         self.emb_layer_norm = nn.LayerNorm(self.embedding_dim)
         self.final_layer_norm = nn.LayerNorm(self.embedding_dim)
+        self.input_layer_norm = nn.LayerNorm(self.embedding_dim)
+        self.graph_norm = nn.LayerNorm(self.embedding_dim)
 
         self.layers = nn.ModuleList(
             [
@@ -469,6 +472,7 @@ class GraphormerGraphEncoder(nn.Module):
         batched: Batch,
         last_state_only: bool = True,
         attn_mask: Optional[torch.Tensor] = None,
+        extra_node_features: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
         Args:
@@ -487,6 +491,9 @@ class GraphormerGraphEncoder(nn.Module):
 
         # Node features with graph token
         x = self.graph_node_feature(batched)  # [B, N+1, C]
+        if extra_node_features is not None:
+            x[:, 1:, :] = x[:, 1:, :] + extra_node_features
+        x = self.input_layer_norm(x)
 
         if self.emb_layer_norm is not None:
             x = self.emb_layer_norm(x)
@@ -518,7 +525,7 @@ class GraphormerGraphEncoder(nn.Module):
         if last_state_only:
             inner_states = [x]
 
-        graph_rep = x[0, :, :]  # [B, C]
+        graph_rep = self.graph_norm(x[0, :, :])
         return inner_states, graph_rep
 
 
@@ -539,6 +546,8 @@ class GlycanGraphormerEncoder(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         attention_dropout: float = 0.1,
+        mono_to_smiles: Optional[Dict[str, str]] = None,
+        atom_hidden_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.num_node_types = num_node_types
@@ -548,6 +557,23 @@ class GlycanGraphormerEncoder(nn.Module):
         self.max_spatial_distance = max_spatial_distance
         self.multi_hop_max_dist = multi_hop_max_dist
         self.num_heads = num_heads
+        self.atom_hidden_dim = atom_hidden_dim or hidden_dim
+        self.mono_to_smiles = mono_to_smiles or {}
+        self.max_atomic_num = 118
+        self.atom_mono_type = self.max_atomic_num + 1
+        self.num_atom_types = self.atom_mono_type + 1
+        self.atom_bond_types = {
+            Chem.rdchem.BondType.SINGLE: 1,
+            Chem.rdchem.BondType.DOUBLE: 2,
+            Chem.rdchem.BondType.TRIPLE: 3,
+            Chem.rdchem.BondType.AROMATIC: 4,
+        }
+        self.atom_special_edge = len(self.atom_bond_types) + 1
+        self.num_atom_edge_types = self.atom_special_edge
+        self.atom_max_in_degree = 8
+        self.atom_max_out_degree = 8
+        self.atom_max_spatial_distance = 8
+        self.atom_multi_hop_max_dist = 3
 
         self.encoder = GraphormerGraphEncoder(
             num_atoms=num_node_types,
@@ -566,8 +592,30 @@ class GlycanGraphormerEncoder(nn.Module):
             attention_dropout=attention_dropout
         )
 
+        self.atom_encoder = GraphormerGraphEncoder(
+            num_atoms=self.num_atom_types,
+            num_in_degree=self.atom_max_in_degree,
+            num_out_degree=self.atom_max_out_degree,
+            num_edges=self.num_atom_edge_types,
+            num_spatial=self.atom_max_spatial_distance + 1,
+            num_edge_dis=self.atom_multi_hop_max_dist + 1,
+            edge_type="multi_hop",
+            multi_hop_max_dist=self.atom_multi_hop_max_dist,
+            num_encoder_layers=max(2, num_layers // 2),
+            embedding_dim=self.atom_hidden_dim,
+            ffn_embedding_dim=self.atom_hidden_dim,
+            num_attention_heads=num_heads,
+            dropout=dropout,
+            attention_dropout=attention_dropout,
+        )
+
+        self.atom_to_mono = nn.Linear(self.atom_hidden_dim, hidden_dim) if self.atom_hidden_dim != hidden_dim else None
+        self.atom_norm = nn.LayerNorm(hidden_dim)
+        self.atom_dropout = nn.Dropout(dropout)
+
         self.cache: Dict[str, GlycanGraph] = {}
         self.tensor_cache: Dict[str, torch.Tensor] = {}
+        self.atom_cache: Dict[str, GlycanGraph] = {}
 
     @property
     def device(self) -> torch.device:
@@ -584,6 +632,47 @@ class GlycanGraphormerEncoder(nn.Module):
 
     def graphs_from_iupacs(self, iupacs: List[str]) -> List[GlycanGraph]:
         return [self.get_graph(i) for i in iupacs]
+
+    def mono_name(self, mono_id: int) -> Optional[str]:
+        if mono_id <= 0 or mono_id > len(GLYCOWORDS):
+            return None
+        return GLYCOWORDS[mono_id - 1]
+
+    def smiles_graph(self, smiles: str) -> GlycanGraph:
+        cached = self.atom_cache.get(smiles)
+        if cached is not None:
+            return cached
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            g = GlycanGraph(node_types=[], edge_index=[], edge_types=[])
+            self.atom_cache[smiles] = g
+            return g
+
+        node_types: List[int] = []
+        edge_index: List[Tuple[int, int]] = []
+        edge_types: List[int] = []
+
+        for atom in mol.GetAtoms():
+            t = min(atom.GetAtomicNum(), self.max_atomic_num) + 1
+            node_types.append(t)
+
+        mono_idx = len(node_types)
+        node_types.append(self.atom_mono_type)
+
+        for bond in mol.GetBonds():
+            u = bond.GetBeginAtomIdx()
+            v = bond.GetEndAtomIdx()
+            bond_type = self.atom_bond_types.get(bond.GetBondType(), 1)
+            edge_index.append((u, v))
+            edge_types.append(bond_type)
+
+        for atom_idx in range(mono_idx):
+            edge_index.append((atom_idx, mono_idx))
+            edge_types.append(self.atom_special_edge)
+
+        g = GlycanGraph(node_types=node_types, edge_index=edge_index, edge_types=edge_types)
+        self.atom_cache[smiles] = g
+        return g
 
     def build_batch(self, graphs: List[GlycanGraph]) -> Batch:
         """Convert list of GlycanGraph objects into padded tensors."""
@@ -641,6 +730,219 @@ class GlycanGraphormerEncoder(nn.Module):
             "attn_edge_type": attn_edge_type,
             "edge_input": edge_input,
         }
+
+    def precompute_atom_graphormer_cache(self, g: GlycanGraph) -> None:
+        if (
+            getattr(g, "spatial_pos", None) is not None
+            and getattr(g, "edge_input", None) is not None
+            and getattr(g, "max_dist_cached", None) == self.atom_multi_hop_max_dist
+            and getattr(g, "max_spatial_cached", None) == self.atom_max_spatial_distance
+        ):
+            return
+
+        num_nodes = len(g.node_types)
+        if num_nodes == 0:
+            g.in_degree = torch.zeros(0, dtype=torch.long)
+            g.out_degree = torch.zeros(0, dtype=torch.long)
+            g.spatial_pos = torch.zeros(0, 0, dtype=torch.long)
+            g.attn_edge_type = torch.zeros(0, 0, dtype=torch.long)
+            g.edge_input = torch.zeros(0, 0, self.atom_multi_hop_max_dist, dtype=torch.long)
+            g.max_dist_cached = self.atom_multi_hop_max_dist
+            g.max_spatial_cached = self.atom_max_spatial_distance
+            return
+
+        device_cpu = torch.device("cpu")
+
+        in_degree = torch.zeros(num_nodes, dtype=torch.long, device=device_cpu)
+        out_degree = torch.zeros(num_nodes, dtype=torch.long, device=device_cpu)
+        spatial_pos = torch.zeros(num_nodes, num_nodes, dtype=torch.long, device=device_cpu)
+        attn_edge_type = torch.zeros(num_nodes, num_nodes, dtype=torch.long, device=device_cpu)
+        edge_input = torch.zeros(
+            num_nodes,
+            num_nodes,
+            self.atom_multi_hop_max_dist,
+            dtype=torch.long,
+            device=device_cpu,
+        )
+
+        adj: List[List[Tuple[int, int]]] = [[] for _ in range(num_nodes)]
+        for (u, v), e_type in zip(g.edge_index, g.edge_types):
+            u = int(u)
+            v = int(v)
+            e_type = int(e_type)
+
+            adj[u].append((v, e_type))
+            adj[v].append((u, e_type))
+
+            in_degree[u] += 1
+            in_degree[v] += 1
+            out_degree[u] += 1
+            out_degree[v] += 1
+
+            attn_edge_type[u, v] = e_type
+            attn_edge_type[v, u] = e_type
+
+        for src in range(num_nodes):
+            dist = [-1] * num_nodes
+            prev_node = [-1] * num_nodes
+            prev_edge = [0] * num_nodes
+
+            dist[src] = 0
+            queue = [src]
+            head = 0
+
+            while head < len(queue):
+                u = queue[head]
+                head += 1
+                du = dist[u]
+
+                if du >= self.atom_multi_hop_max_dist:
+                    continue
+
+                for v, e_type in adj[u]:
+                    if dist[v] == -1:
+                        dist[v] = du + 1
+                        prev_node[v] = u
+                        prev_edge[v] = e_type
+                        queue.append(v)
+
+            for dst in range(num_nodes):
+                d = dist[dst]
+                if d < 0:
+                    continue
+                d_clamped = min(d, self.atom_max_spatial_distance)
+                spatial_pos[src, dst] = d_clamped
+
+                if d <= 0:
+                    continue
+
+                path: List[int] = []
+                cur = dst
+                steps = 0
+                while cur != src and cur != -1 and steps < self.atom_multi_hop_max_dist:
+                    e_type = prev_edge[cur]
+                    if e_type == 0:
+                        break
+                    path.append(e_type)
+                    cur = prev_node[cur]
+                    steps += 1
+
+                path = path[::-1]
+                for hop_idx, e_type in enumerate(path):
+                    if hop_idx >= self.atom_multi_hop_max_dist:
+                        break
+                    edge_input[src, dst, hop_idx] = e_type
+
+        g.in_degree = in_degree
+        g.out_degree = out_degree
+        g.spatial_pos = spatial_pos
+        g.attn_edge_type = attn_edge_type
+        g.edge_input = edge_input
+        g.max_dist_cached = self.atom_multi_hop_max_dist
+        g.max_spatial_cached = self.atom_max_spatial_distance
+
+    def build_atom_batch(self, graphs: List[GlycanGraph]) -> Batch:
+        B = len(graphs)
+        if B == 0:
+            raise ValueError("build_atom_batch called with empty graph list")
+
+        max_nodes = max(len(g.node_types) for g in graphs) or 1
+        N = max_nodes
+        device = self.device
+        H = self.atom_encoder.layers[0].self_attn.num_heads
+
+        x = torch.zeros(B, N, 1, dtype=torch.long, device=device)
+        in_degree = torch.zeros(B, N, dtype=torch.long, device=device)
+        out_degree = torch.zeros(B, N, dtype=torch.long, device=device)
+        spatial_pos = torch.zeros(B, N, N, dtype=torch.long, device=device)
+        attn_bias = torch.zeros(B, N + 1, N + 1, dtype=torch.float32, device=device)
+        attn_edge_type = torch.zeros(B, N, N, 1, dtype=torch.long, device=device)
+        edge_input = torch.zeros(
+            B,
+            N,
+            N,
+            self.atom_multi_hop_max_dist,
+            H,
+            dtype=torch.long,
+            device=device,
+        )
+
+        clamp_in = self.atom_max_in_degree - 1
+        clamp_out = self.atom_max_out_degree - 1
+
+        for b, g in enumerate(graphs):
+            num_nodes = len(g.node_types)
+            if num_nodes == 0:
+                continue
+
+            self.precompute_atom_graphormer_cache(g)
+
+            x[b, :num_nodes, 0] = torch.tensor(g.node_types, dtype=torch.long, device=device)
+
+            if g.in_degree is not None:
+                in_degree[b, :num_nodes] = g.in_degree.to(device).clamp(max=clamp_in)
+            if g.out_degree is not None:
+                out_degree[b, :num_nodes] = g.out_degree.to(device).clamp(max=clamp_out)
+            if g.spatial_pos is not None:
+                spatial_pos[b, :num_nodes, :num_nodes] = g.spatial_pos.to(device)
+            if g.attn_edge_type is not None:
+                attn_edge_type[b, :num_nodes, :num_nodes, 0] = g.attn_edge_type.to(device)
+            if g.edge_input is not None:
+                edge_input[b, :num_nodes, :num_nodes, :, :] = g.edge_input.to(device).unsqueeze(-1).repeat(1, 1, 1, 1, H)
+
+        attn_mask = x[:, :, 0].eq(0)
+        attn_bias[:, 1:, 1:][attn_mask] = float("-inf")
+        attn_bias[:, 1:, 1:][attn_mask.unsqueeze(2)] = float("-inf")
+
+        return {
+            "x": x,
+            "in_degree": in_degree,
+            "out_degree": out_degree,
+            "attn_bias": attn_bias,
+            "spatial_pos": spatial_pos,
+            "attn_edge_type": attn_edge_type,
+            "edge_input": edge_input,
+        }
+
+    def build_atom_features(self, graphs: List[GlycanGraph], batched: Batch) -> torch.Tensor:
+        B, N = batched["x"].shape[:2]
+        device = self.device
+        target_dim = self.encoder.embedding_dim
+        atom_features = torch.zeros(B, N, target_dim, device=device)
+
+        atom_graphs: List[GlycanGraph] = []
+        owners: List[Tuple[int, int]] = []
+        for b, g in enumerate(graphs):
+            for mono_idx, mono_id in enumerate(g.node_types):
+                if mono_id == 0:
+                    continue
+                mono_name = self.mono_name(mono_id)
+                smiles = None if mono_name is None else self.mono_to_smiles.get(mono_name)
+                if not smiles:
+                    continue
+                atom_graphs.append(self.smiles_graph(smiles))
+                owners.append((b, mono_idx))
+
+        if not atom_graphs:
+            return atom_features
+
+        atom_batch = self.build_atom_batch(atom_graphs)
+        atom_inner, _ = self.atom_encoder(atom_batch, last_state_only=True)
+        atom_last = atom_inner[-1][1:, :, :].transpose(0, 1)
+        atom_mask = ~atom_batch["x"][:, :, 0].eq(0)
+
+        for i, (b, m) in enumerate(owners):
+            mask = atom_mask[i]
+            if not mask.any():
+                continue
+            pooled = atom_last[i][mask].mean(dim=0)
+            if self.atom_to_mono is not None:
+                pooled = self.atom_to_mono(pooled)
+            atom_features[b, m] = pooled
+
+        atom_features = self.atom_dropout(atom_features)
+        atom_features = self.atom_norm(atom_features)
+        return atom_features
 
     def precompute_graphormer_cache(self, g: GlycanGraph) -> None:
         """Cache SPD, degrees, edge types and multi hop paths on CPU for a single graph."""
@@ -772,8 +1074,13 @@ class GlycanGraphormerEncoder(nn.Module):
         """
         graphs = self.graphs_from_iupacs(iupacs)
         batched = self.build_batch(graphs)
+        atom_features = self.build_atom_features(graphs, batched)
 
-        inner_states, graph_rep = self.encoder(batched, last_state_only=True)
+        inner_states, graph_rep = self.encoder(
+            batched,
+            last_state_only=True,
+            extra_node_features=atom_features,
+        )
         last_state = inner_states[-1]  # [T, B, H]
         node_states = last_state[1:, :, :].transpose(0, 1)  # [B, N, H]
 
@@ -861,7 +1168,9 @@ class GlycanGraphormerPretrainer(nn.Module):
         """
         device = self.device
 
-        batched = self.build_batched_graphs(iupacs)
+        graphs = self.encoder.graphs_from_iupacs(iupacs)
+        batched = self.encoder.build_batch(graphs)
+        atom_features = self.encoder.build_atom_features(graphs, batched)
         batched = {k: v.to(device) for k, v in batched.items()}
 
         batched_masked, labels = self.apply_node_masking(batched)
@@ -871,6 +1180,7 @@ class GlycanGraphormerPretrainer(nn.Module):
             batched_masked,
             last_state_only=True,
             attn_mask=None,
+            extra_node_features=atom_features,
         )
         last_state = inner_states[-1]  # [T, B, H]
         node_states = last_state[1:, :, :].transpose(0, 1)  # [B, N, H]
@@ -897,11 +1207,14 @@ class GlycanGraphormerPretrainer(nn.Module):
     ) -> torch.Tensor:
         """Convenience method to get graph level embeddings [B, H]."""
         self.eval()
-        batched = self.build_batched_graphs(iupacs)
+        graphs = self.encoder.graphs_from_iupacs(iupacs)
+        batched = self.encoder.build_batch(graphs)
+        atom_features = self.encoder.build_atom_features(graphs, batched)
         batched = {k: v.to(self.device) for k, v in batched.items()}
         _, graph_rep = self.encoder.encoder(
             batched,
             last_state_only=True,
             attn_mask=None,
+            extra_node_features=atom_features,
         )
         return graph_rep
