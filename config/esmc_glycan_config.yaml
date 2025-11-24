@@ -1,0 +1,33 @@
+# Logging and Paths
+wandb_proj: NoSigmoidTest # Weights and Biases project to log results to.
+wandb_save: True # Whether or not to log to Weights and Biases.
+log_file: ./logs/scratch_testing.log # Location of log file
+model_save_dir: ./models/best_models # Location to save best models
+data_cache_dir: ./datasets # Location of downloaded data (use `conplex_dti download`)
+
+# Misc
+device: 0 # CUDA device to use for training
+replicate: 0 # Random seed
+verbosity: 3 # Verbosity level for logging
+
+prot_glycan_root: ./data
+
+num_hidden_layers: 2 # Number of hidden layers in projection to co-embedding space
+dropout: 0.25 # Dropout rate in projection to co-embedding space
+lambda_spearman: 0.75 # Weight for spearman loss component
+coattention: False # Whether to use coattention between protein and glycan embeddings
+nonbinder_cutoff: -4.0 # Cutoff value below which to consider a glycan-protein pair as a non-binder
+
+# Training
+epochs: 50 # Number of epochs to train for
+batch_size: 128 # Size of batch for binary data set
+gradient_accumulation_steps: 1 # Number of steps to accumulate gradients over
+
+early_stopping: 
+  enabled: True # Whether to use early stopping
+  patience: 8 # Number of epochs with no improvement after which training will be stopped
+  metric: "spearmanp"
+
+num_workers: 0 # Number of workers for PyTorch DataLoader
+every_n_val: 1 # How often to run validation during training (epochs)
+eval_metric: [ "spearmanp", "bs-spearmanp", "auroc", "mse"] # Metrics to evaluate on during validation
